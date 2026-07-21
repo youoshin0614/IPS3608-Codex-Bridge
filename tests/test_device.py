@@ -70,7 +70,7 @@ def test_device_reuses_one_serial_handle_for_many_operations():
         created.append(item)
         return item
 
-    device = IPS3608Device("COM_TEST", serial_factory=factory)
+    device = IPS3608Device("COM_TEST", serial_factory=factory, min_write_gap=0.0)
     device.connect()
     first = device.read_status()
     device.set_output(True)
@@ -85,4 +85,3 @@ def test_device_reuses_one_serial_handle_for_many_operations():
 
     device.close()
     assert not device.connected
-

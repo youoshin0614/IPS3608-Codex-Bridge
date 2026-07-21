@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import time
@@ -21,6 +22,7 @@ from .service import run_service
 
 DEFAULT_TCP_PORT = 36080
 DEFAULT_DEVICE_PORT = "COM3"
+DEFAULT_POLL_INTERVAL = 5.0
 
 
 def state_directory() -> Path:
@@ -53,7 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--device-port",
         default=os.environ.get("IPS3608_PORT", DEFAULT_DEVICE_PORT),
     )
-    start.add_argument("--poll-interval", type=float, default=1.0)
+    start.add_argument(
+        "--poll-interval",
+        type=float,
+        default=float(os.environ.get("IPS3608_POLL_INTERVAL", DEFAULT_POLL_INTERVAL)),
+    )
     start.add_argument("--simulate", action="store_true")
 
     serve = commands.add_parser("serve", help=argparse.SUPPRESS)
@@ -61,7 +67,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--device-port",
         default=os.environ.get("IPS3608_PORT", DEFAULT_DEVICE_PORT),
     )
-    serve.add_argument("--poll-interval", type=float, default=1.0)
+    serve.add_argument(
+        "--poll-interval",
+        type=float,
+        default=float(os.environ.get("IPS3608_POLL_INTERVAL", DEFAULT_POLL_INTERVAL)),
+    )
     serve.add_argument("--simulate", action="store_true")
 
     for name, help_text in (
@@ -85,26 +95,26 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.command == "ports":
         return _ports(args.json)
     if args.command == "start":
-        response = _ensure_started(
-            args.tcp_port,
-            device_port=args.device_port,
-            poll_interval=args.poll_interval,
-            simulate=args.simulate,
-        )
+        try:
+            response = _ensure_started(
+                args.tcp_port,
+                device_port=args.device_port,
+                poll_interval=args.poll_interval,
+                simulate=args.simulate,
+            )
+        except BridgeUnavailable as exc:
+            return _print_error(str(exc), args.json)
         return _print_response("health", response, args.json)
     if args.command == "stop":
         return _stop(args.tcp_port, args.json)
 
     try:
-        _ensure_started(
-            args.tcp_port,
-            device_port=os.environ.get("IPS3608_PORT", DEFAULT_DEVICE_PORT),
-            poll_interval=1.0,
-            simulate=os.environ.get("IPS3608_SIMULATE") == "1",
-        )
         response = request(args.command, tcp_port=args.tcp_port)
     except BridgeUnavailable as exc:
-        return _print_error(str(exc), args.json)
+        return _print_error(
+            f"{exc}; run 'ips3608-bridge start' explicitly before control commands",
+            args.json,
+        )
     return _print_response(args.command, response, args.json)
 
 
@@ -135,9 +145,19 @@ def _ensure_started(
     simulate: bool,
 ) -> dict[str, Any]:
     try:
-        return request("health", tcp_port=tcp_port, timeout=0.5)
+        existing = request("health", tcp_port=tcp_port, timeout=2.0)
+        if existing.get("connected"):
+            return existing
+        raise BridgeUnavailable(
+            "bridge is running but the device is not connected: "
+            f"{existing.get('last_error') or 'unknown device error'}"
+        )
     except BridgeUnavailable:
-        pass
+        if _port_is_listening(tcp_port):
+            raise BridgeUnavailable(
+                f"localhost port {tcp_port} is occupied or an existing bridge is unresponsive; "
+                "refusing to start a duplicate service"
+            )
 
     command = [
         sys.executable,
@@ -176,10 +196,19 @@ def _ensure_started(
     last_error: BaseException | None = None
     while time.monotonic() < deadline:
         try:
-            return request("health", tcp_port=tcp_port, timeout=0.5)
+            response = request("health", tcp_port=tcp_port, timeout=1.0)
+            if response.get("connected"):
+                return response
+            last_error = BridgeUnavailable(
+                response.get("last_error") or "device has not connected"
+            )
         except BridgeUnavailable as exc:
             last_error = exc
             time.sleep(0.15)
+    try:
+        request("shutdown", tcp_port=tcp_port, timeout=1.0)
+    except BridgeUnavailable:
+        pass
     raise BridgeUnavailable(f"bridge did not start within 10 seconds: {last_error}")
 
 
@@ -190,13 +219,24 @@ def _stop(tcp_port: int, as_json: bool) -> int:
         return _print_error(str(exc), as_json)
     code = _print_response("stop", response, as_json)
     deadline = time.monotonic() + 8.0
+    closed_checks = 0
     while time.monotonic() < deadline:
-        try:
-            request("health", tcp_port=tcp_port, timeout=0.2)
-        except BridgeUnavailable:
-            return code
+        if not _port_is_listening(tcp_port):
+            closed_checks += 1
+            if closed_checks >= 5:
+                return code
+        else:
+            closed_checks = 0
         time.sleep(0.1)
     return _print_error("bridge acknowledged shutdown but is still running", as_json)
+
+
+def _port_is_listening(tcp_port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", tcp_port), timeout=0.2):
+            return True
+    except OSError:
+        return False
 
 
 def _ports(as_json: bool) -> int:
@@ -260,4 +300,3 @@ def _print_error(message: str, as_json: bool) -> int:
     else:
         print(f"Error: {message}", file=sys.stderr)
     return 1
-

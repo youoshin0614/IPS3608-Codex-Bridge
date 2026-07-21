@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.0 - 2026-07-21
+
+- Require explicit `start`; ordinary commands no longer auto-start a service.
+- Refuse duplicate startup when the localhost port is occupied or unresponsive.
+- Increase the default polling interval from one to five seconds.
+- Pace serial writes, lengthen write timeout, cool down before reconnect, and reduce temperature polling.
+- Verify `on` and `off` against real voltage telemetry without retrying ambiguous `on` commands.
+- Wait for the listener to remain closed before reporting a successful stop.
+- Avoid blocking 64-byte reads that can aggravate the IPS3608 Windows CDC driver, and use a guarded recovery-open sequence for intermittent error 995.
+- Document the physical USB-path fault found during validation and the requirement for manual shutdown when software cannot verify output-off.
+
 ## 0.1.1 - 2026-07-21
 
 - Completed no-load hardware validation on an IPS3608 connected as COM3.
@@ -9,7 +20,7 @@
 
 ## 0.1.0 - 2026-07-21
 
-- Initial independent implementation.
+- Initial public release.
 - Persistent serial session with localhost command bridge.
 - Switch-only API: status, output on, and output off.
 - Safe service shutdown and automatic local service startup.

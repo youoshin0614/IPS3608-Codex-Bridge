@@ -29,9 +29,15 @@ class BridgeState:
 
 
 class BridgeController:
-    def __init__(self, device: Any, poll_interval: float = 1.0) -> None:
+    def __init__(
+        self,
+        device: Any,
+        poll_interval: float = 5.0,
+        output_verify_timeout: float = 3.0,
+    ) -> None:
         self.device = device
         self.poll_interval = max(0.25, poll_interval)
+        self.output_verify_timeout = max(0.25, output_verify_timeout)
         self.state = BridgeState(started_at=time.monotonic())
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -160,12 +166,47 @@ class BridgeController:
             try:
                 self._ensure_connected()
                 self.device.set_output(enabled)
+                verified, measurement, verification_error = self._verify_output_state(
+                    enabled
+                )
+                if not verified:
+                    if enabled:
+                        # Never retry an ambiguous ON. Prove a safe OFF or
+                        # report the physical output state as unknown.
+                        _safe_measurement, safe_off_error = (
+                            self._recover_and_verify_output_off()
+                        )
+                        self.state.output_commanded = (
+                            False if safe_off_error is None else None
+                        )
+                        if safe_off_error:
+                            verification_error = (
+                                f"{verification_error}; safe-off error: "
+                                f"{safe_off_error}"
+                            )
+                    else:
+                        measurement, safe_off_error = (
+                            self._recover_and_verify_output_off()
+                        )
+                        verified = safe_off_error is None
+                        if safe_off_error:
+                            verification_error = safe_off_error
+                    if not verified:
+                        self.state.last_error = verification_error
+                        return {
+                            "ok": False,
+                            "error": "output_verification_failed",
+                            "message": verification_error,
+                        }
                 self.state.output_commanded = enabled
                 self.state.last_error = None
                 return {
                     "ok": True,
                     "output": "on" if enabled else "off",
-                    "message": "output command sent",
+                    "message": "output command verified by voltage telemetry",
+                    "verified_voltage_v": (
+                        None if measurement is None else measurement.voltage_v
+                    ),
                 }
             except Exception as exc:
                 self.state.last_error = str(exc)
@@ -176,25 +217,84 @@ class BridgeController:
                     pass
 
                 # Retrying ON is intentionally avoided because a failed reply
-                # leaves delivery ambiguous. OFF is safe to retry once.
-                if not enabled:
-                    try:
-                        self._ensure_connected()
-                        self.device.set_output(False)
-                        self.state.output_commanded = False
+                # leaves delivery ambiguous. OFF is safe to retry and verify.
+                measurement, safe_off_error = self._recover_and_verify_output_off()
+                if safe_off_error is None and measurement is not None:
+                    self.state.output_commanded = False
+                    if not enabled:
                         return {
                             "ok": True,
                             "output": "off",
-                            "message": "output-off sent after reconnect",
+                            "message": "output-off verified after reconnect",
+                            "verified_voltage_v": measurement.voltage_v,
                         }
-                    except Exception as retry_exc:
-                        self.state.last_error = str(retry_exc)
+                elif enabled:
+                    self.state.output_commanded = None
+                    self.state.last_error = (
+                        f"output-on command failed: {exc}; safe-off error: "
+                        f"{safe_off_error}"
+                    )
+                else:
+                    self.state.last_error = safe_off_error
 
                 return {
                     "ok": False,
                     "error": "output_command_failed",
                     "message": self.state.last_error,
                 }
+
+    def _recover_and_verify_output_off(
+        self,
+    ) -> tuple[Measurement | None, str | None]:
+        last_error = "output-off was not attempted"
+        for attempt in range(2):
+            try:
+                self._ensure_connected()
+                self.device.set_output(False)
+                verified, measurement, verification_error = (
+                    self._verify_output_state(False)
+                )
+                if verified and measurement is not None:
+                    self.state.output_commanded = False
+                    return measurement, None
+                last_error = verification_error
+            except Exception as exc:
+                last_error = str(exc)
+            try:
+                self.device.abandon_connection()
+            except Exception:
+                pass
+            if attempt == 0:
+                time.sleep(0.75)
+        return None, last_error
+
+    def _verify_output_state(
+        self,
+        enabled: bool,
+    ) -> tuple[bool, Measurement | None, str]:
+        deadline = time.monotonic() + self.output_verify_timeout
+        last_measurement: Measurement | None = None
+        last_error = "no telemetry was received"
+        while time.monotonic() < deadline:
+            try:
+                last_measurement = self.device.read_status()
+                self.state.last_measurement = last_measurement
+                self.state.last_measurement_at = time.monotonic()
+                voltage = float(last_measurement.voltage_v)
+                if enabled and voltage > 0.1:
+                    return True, last_measurement, ""
+                if not enabled and voltage <= 0.1:
+                    return True, last_measurement, ""
+                last_error = (
+                    f"output did not turn {'on' if enabled else 'off'}: "
+                    f"measured {voltage:.3f} V"
+                )
+            except Exception as exc:
+                last_error = f"output verification telemetry failed: {exc}"
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.2, remaining))
+        return False, last_measurement, last_error
 
     def _measurement_age(self) -> float | None:
         if not self.state.last_measurement_at:

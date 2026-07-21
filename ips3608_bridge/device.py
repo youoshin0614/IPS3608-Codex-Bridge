@@ -53,6 +53,8 @@ class IPS3608Device:
         baudrate: int = 9600,
         read_timeout: float = 0.2,
         serial_factory: SerialFactory = serial.Serial,
+        min_write_gap: float = 0.25,
+        temperature_interval: float = 30.0,
     ) -> None:
         self.port = port
         self.baudrate = baudrate
@@ -62,6 +64,10 @@ class IPS3608Device:
         self._io_lock = threading.RLock()
         self._receive_buffer = bytearray()
         self._last_temperature: float | None = None
+        self._min_write_gap = max(0.0, min_write_gap)
+        self._last_write_at = 0.0
+        self._temperature_interval = max(1.0, temperature_interval)
+        self._last_temperature_at = 0.0
 
     @property
     def connected(self) -> bool:
@@ -76,8 +82,6 @@ class IPS3608Device:
             for attempt in range(max(1, attempts)):
                 try:
                     self._raw_close()
-                    if attempt:
-                        self._prime_windows_cdc()
                     self._serial = self._new_serial(dtr=True, rts=True)
                     self._serial.reset_input_buffer()
                     self._serial.reset_output_buffer()
@@ -94,7 +98,9 @@ class IPS3608Device:
                 except Exception as exc:
                     last_error = exc
                     self._raw_close()
-                    time.sleep(0.15 * (attempt + 1))
+                    if attempt + 1 < max(1, attempts):
+                        time.sleep(0.15 * (attempt + 1))
+                        self._prime_port()
 
             raise DeviceError(
                 f"unable to connect to {self.port} after {max(1, attempts)} attempts: {last_error}"
@@ -109,18 +115,24 @@ class IPS3608Device:
                 )
                 voltage, current, device_power = decode_live(live.payload)
 
-                temperature: float | None
-                try:
-                    temp_frame = self._query(
-                        temperature_request(),
-                        COMMAND_READ,
-                        REGISTER_TEMPERATURE,
-                        timeout=0.6,
-                    )
-                    temperature = decode_temperature(temp_frame.payload)
-                    self._last_temperature = temperature
-                except DeviceError:
-                    temperature = self._last_temperature
+                if (
+                    self._last_temperature is None
+                    or time.monotonic() - self._last_temperature_at
+                    >= self._temperature_interval
+                ):
+                    try:
+                        temp_frame = self._query(
+                            temperature_request(),
+                            COMMAND_READ,
+                            REGISTER_TEMPERATURE,
+                            timeout=0.6,
+                        )
+                        self._last_temperature = decode_temperature(temp_frame.payload)
+                        self._last_temperature_at = time.monotonic()
+                    except DeviceError as exc:
+                        if not str(exc).startswith("timeout waiting for register"):
+                            raise
+                temperature = self._last_temperature
 
                 return Measurement(
                     timestamp=datetime.now(timezone.utc).isoformat(),
@@ -171,8 +183,11 @@ class IPS3608Device:
             bytesize=8,
             parity="N",
             stopbits=1,
-            timeout=self.read_timeout,
-            write_timeout=0.7,
+            # The IPS3608 Windows CDC driver can wedge after repeated
+            # overlapped read cancellations. Poll queued bytes instead of
+            # issuing a 64-byte blocking read for each shorter reply frame.
+            timeout=0.0,
+            write_timeout=2.0,
             rtscts=False,
             dsrdtr=False,
         )
@@ -182,13 +197,12 @@ class IPS3608Device:
         port.open()
         return port
 
-    def _prime_windows_cdc(self) -> None:
-        primer: Any | None = None
+    def _prime_port(self) -> None:
+        """Recover from the IPS3608 Windows driver's intermittent error 995."""
+        primer = None
         try:
             primer = self._new_serial(dtr=False, rts=False)
         except (OSError, serial.SerialException):
-            # On affected usbser devices even the failed transition clears
-            # enough stale state for the following normal open.
             pass
         finally:
             if primer is not None and primer.is_open:
@@ -202,7 +216,12 @@ class IPS3608Device:
         expected_register: int,
         timeout: float,
     ) -> Any:
-        self._write(request)
+        try:
+            self._write(request)
+        except Exception as exc:
+            raise DeviceError(
+                f"request write failed for register 0x{expected_register:02X}: {exc}"
+            ) from exc
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -210,6 +229,7 @@ class IPS3608Device:
             except (OSError, serial.SerialException) as exc:
                 raise DeviceError(f"serial read failed: {exc}") from exc
             if not chunk:
+                time.sleep(0.01)
                 continue
             self._receive_buffer.extend(chunk)
             for frame in extract_frames(self._receive_buffer):
@@ -224,7 +244,15 @@ class IPS3608Device:
 
     def _write(self, data: bytes) -> None:
         self._require_connection()
-        self._serial.write(data)
+        delay = self._min_write_gap - (time.monotonic() - self._last_write_at)
+        if delay > 0:
+            time.sleep(delay)
+        try:
+            written = self._serial.write(data)
+        finally:
+            self._last_write_at = time.monotonic()
+        if written != len(data):
+            raise DeviceError(f"short serial write: wrote {written} of {len(data)} bytes")
         self._serial.flush()
 
     def _require_connection(self) -> None:
@@ -239,6 +267,7 @@ class IPS3608Device:
             finally:
                 self._serial = None
         self._receive_buffer.clear()
+        self._last_write_at = 0.0
 
 
 class SimulatedDevice:
