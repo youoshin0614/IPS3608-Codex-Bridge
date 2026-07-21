@@ -94,9 +94,9 @@ finally {
 
 协议范围与设计说明见 [docs/PROTOCOL.md](docs/PROTOCOL.md) 和 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
-## 独立实现与致谢
+## 参考资料与致谢
 
-这是一个独立实现，没有复制 `daktari77/FNIRSI-IPS3608` 的源代码。协议行为参考了公开资料及以下项目：
+协议行为参考了公开资料及以下项目：
 
 - `daktari77/FNIRSI-IPS3608`；
 - `cho45/fnirsi-dps-150`；
