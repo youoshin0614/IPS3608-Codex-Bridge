@@ -14,7 +14,15 @@ def test_cli_has_no_voltage_current_set_or_raw_command():
 
 def test_default_poll_interval_is_conservative():
     args = build_parser().parse_args(["start"])
-    assert args.poll_interval == 5.0
+    assert args.poll_interval == 0.0
+    assert cli.normalize_poll_interval(args.poll_interval) == 0.0
+
+
+def test_positive_poll_interval_is_clamped_without_changing_on_demand_zero():
+    assert cli.normalize_poll_interval(0.0) == 0.0
+    assert cli.normalize_poll_interval(-1.0) == 0.0
+    assert cli.normalize_poll_interval(0.1) == 0.25
+    assert cli.normalize_poll_interval(15.0) == 15.0
 
 
 def test_control_command_never_implicitly_starts_service(monkeypatch):

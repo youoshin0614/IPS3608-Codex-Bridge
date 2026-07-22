@@ -22,7 +22,14 @@ from .service import run_service
 
 DEFAULT_TCP_PORT = 36080
 DEFAULT_DEVICE_PORT = "COM3"
-DEFAULT_POLL_INTERVAL = 5.0
+# Zero means on-demand telemetry only.  This reserves the CDC endpoint for
+# explicit status and safety commands instead of continuously writing reads.
+DEFAULT_POLL_INTERVAL = 0.0
+
+
+def normalize_poll_interval(value: float) -> float:
+    """Preserve zero as on-demand mode; clamp only positive intervals."""
+    return 0.0 if value <= 0.0 else max(0.25, value)
 
 
 def state_directory() -> Path:
@@ -109,7 +116,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         return _stop(args.tcp_port, args.json)
 
     try:
-        response = request(args.command, tcp_port=args.tcp_port)
+        response = request(
+            args.command,
+            tcp_port=args.tcp_port,
+            timeout=30.0 if args.command == "off" else 6.0,
+        )
     except BridgeUnavailable as exc:
         return _print_error(
             f"{exc}; run 'ips3608-bridge start' explicitly before control commands",
@@ -169,7 +180,7 @@ def _ensure_started(
         "--device-port",
         device_port,
         "--poll-interval",
-        str(max(0.25, poll_interval)),
+        str(normalize_poll_interval(poll_interval)),
     ]
     if simulate:
         command.append("--simulate")
@@ -205,16 +216,15 @@ def _ensure_started(
         except BridgeUnavailable as exc:
             last_error = exc
             time.sleep(0.15)
-    try:
-        request("shutdown", tcp_port=tcp_port, timeout=1.0)
-    except BridgeUnavailable:
-        pass
-    raise BridgeUnavailable(f"bridge did not start within 10 seconds: {last_error}")
+    raise BridgeUnavailable(
+        "bridge did not become ready within 10 seconds; its listener may remain "
+        f"available for a safety OFF retry: {last_error}"
+    )
 
 
 def _stop(tcp_port: int, as_json: bool) -> int:
     try:
-        response = request("shutdown", tcp_port=tcp_port)
+        response = request("shutdown", tcp_port=tcp_port, timeout=30.0)
     except BridgeUnavailable as exc:
         return _print_error(str(exc), as_json)
     code = _print_response("stop", response, as_json)

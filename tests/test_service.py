@@ -33,6 +33,39 @@ class AmbiguousOnWriteFailureDevice(SimulatedDevice):
         super().set_output(False)
 
 
+class PersistentOffFailureDevice(SimulatedDevice):
+    def __init__(self):
+        super().__init__()
+        self.fail_off = False
+
+    def set_output(self, enabled: bool) -> None:
+        if not enabled and self.fail_off:
+            raise RuntimeError("persistent output-off write failure")
+        super().set_output(enabled)
+
+
+class OneShotOffFailureDevice(SimulatedDevice):
+    def __init__(self):
+        super().__init__()
+        self.fail_next_off = False
+
+    def set_output(self, enabled: bool) -> None:
+        if not enabled and self.fail_next_off:
+            self.fail_next_off = False
+            raise RuntimeError("short serial write: wrote 0 of 6 bytes")
+        super().set_output(enabled)
+
+
+class CountingStatusDevice(SimulatedDevice):
+    def __init__(self):
+        super().__init__()
+        self.read_count = 0
+
+    def read_status(self):
+        self.read_count += 1
+        return super().read_status()
+
+
 def test_controller_keeps_one_device_connection_and_blocks_unsafe_commands():
     device = SimulatedDevice()
     controller = BridgeController(device, poll_interval=60.0)
@@ -112,5 +145,75 @@ def test_ambiguous_on_write_is_not_retried_and_safe_off_is_verified():
         assert device.off_write_count >= 1
         assert device.output_enabled is False
         assert controller.state.output_commanded is False
+    finally:
+        controller.close()
+
+
+def test_shutdown_is_refused_until_output_off_is_verified():
+    device = PersistentOffFailureDevice()
+    controller = BridgeController(
+        device,
+        poll_interval=60.0,
+        output_verify_timeout=0.05,
+    )
+    callback_called = False
+
+    def callback():
+        nonlocal callback_called
+        callback_called = True
+
+    controller.set_shutdown_callback(callback)
+    controller.start()
+    try:
+        assert controller.handle("on")["ok"]
+        device.fail_off = True
+
+        response = controller.handle("shutdown")
+
+        assert response["ok"] is False
+        assert response["error"] == "output_off_unverified"
+        assert controller.state.output_commanded is None
+        assert controller._stop_event.is_set() is False
+        assert callback_called is False
+    finally:
+        device.fail_off = False
+        controller.handle("off")
+        controller.close()
+
+
+def test_off_reconnect_uses_automation_safe_start_contract():
+    device = OneShotOffFailureDevice()
+    controller = BridgeController(device, poll_interval=60.0)
+    controller.start()
+    try:
+        assert controller.handle("on")["ok"]
+        device.fail_next_off = True
+
+        response = controller.handle("off")
+
+        assert response["ok"] is True
+        assert response["verified_voltage_v"] <= 0.1
+        assert device.output_enabled is False
+        assert device.connect_count == 2
+        assert controller.state.output_commanded is False
+    finally:
+        controller.close()
+
+
+def test_default_on_demand_mode_does_not_poll_serial_in_background():
+    device = CountingStatusDevice()
+    controller = BridgeController(device)
+    controller.start()
+    try:
+        reads_after_start = device.read_count
+        assert controller._monitor is None
+        health = controller.handle("health")
+        assert health["telemetry_mode"] == "on_demand"
+        assert health["poll_interval_s"] == 0.0
+
+        for _ in range(20):
+            assert controller.handle("status")["ok"]
+
+        assert device.read_count == reads_after_start
     finally:
         controller.close()

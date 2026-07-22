@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 - 2026-07-22
+
+- Switch to on-demand telemetry with a 15-second cache and disable optional temperature polling by default.
+- Give output-off requests priority over background recovery work.
+- Refuse `stop` and keep the service available when voltage telemetry cannot verify output-off.
+- Allow safety commands enough client time to finish bounded reconnect and verification work without duplicate retries.
+- Port the full automation edition's force-safe-start and reconnect-off verification contract while keeping all setpoint and raw-command interfaces absent.
+- Enforce a three-second physical-device stabilization window before ON and lengthen Windows USB recovery backoff.
+- Fix the background launcher so a zero on-demand interval remains zero instead of being silently clamped to 0.25 seconds; expose the effective telemetry mode in health responses.
+
 ## 0.2.0 - 2026-07-21
 
 - Require explicit `start`; ordinary commands no longer auto-start a service.

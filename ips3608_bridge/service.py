@@ -32,29 +32,32 @@ class BridgeController:
     def __init__(
         self,
         device: Any,
-        poll_interval: float = 5.0,
+        poll_interval: float = 0.0,
         output_verify_timeout: float = 3.0,
     ) -> None:
         self.device = device
-        self.poll_interval = max(0.25, poll_interval)
+        self.poll_interval = 0.0 if poll_interval <= 0.0 else max(0.25, poll_interval)
         self.output_verify_timeout = max(0.25, output_verify_timeout)
         self.state = BridgeState(started_at=time.monotonic())
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
+        self._priority_off = threading.Event()
         self._monitor: threading.Thread | None = None
         self._shutdown_callback: Callable[[], None] | None = None
+        self._output_enable_ready_at = 0.0
 
     def set_shutdown_callback(self, callback: Callable[[], None]) -> None:
         self._shutdown_callback = callback
 
     def start(self) -> None:
         self._refresh_status()
-        self._monitor = threading.Thread(
-            target=self._monitor_loop,
-            name="ips3608-monitor",
-            daemon=True,
-        )
-        self._monitor.start()
+        if self.poll_interval > 0.0:
+            self._monitor = threading.Thread(
+                target=self._monitor_loop,
+                name="ips3608-monitor",
+                daemon=True,
+            )
+            self._monitor.start()
 
     def close(self) -> None:
         self._stop_event.set()
@@ -81,31 +84,78 @@ class BridgeController:
         if command == "on":
             return self._output_response(True)
         if command == "off":
-            return self._output_response(False)
+            self._priority_off.set()
+            try:
+                return self._output_response(False)
+            finally:
+                self._priority_off.clear()
         if command == "shutdown":
-            # Stop the monitor before waiting for its I/O lock, then perform
-            # fail-safe device cleanup before acknowledging shutdown.
-            self._stop_event.set()
-            with self._lock:
-                try:
-                    self.device.close(safe_output_off=True)
-                except Exception as exc:
-                    LOG.warning("pre-shutdown device close failed: %s", exc)
-            callback = self._shutdown_callback
-            if callback is not None:
-                threading.Thread(target=callback, daemon=True).start()
-            return {"ok": True, "message": "bridge safely released; shutdown requested"}
+            return self._shutdown()
         raise AssertionError("unreachable command dispatch")
 
     def _monitor_loop(self) -> None:
         while not self._stop_event.wait(self.poll_interval):
-            self._refresh_status()
+            if self._priority_off.is_set():
+                continue
+            if not self._lock.acquire(timeout=0.1):
+                continue
+            try:
+                if not self._priority_off.is_set():
+                    self._refresh_status()
+            finally:
+                self._lock.release()
+
+    def _shutdown(self) -> dict[str, Any]:
+        self._priority_off.set()
+        try:
+            with self._lock:
+                measurement, error = self._recover_and_verify_output_off()
+                if error is not None or measurement is None:
+                    self.state.output_commanded = None
+                    self.state.last_error = error
+                    return {
+                        "ok": False,
+                        "error": "output_off_unverified",
+                        "message": (
+                            "bridge remains running because output-off could not be "
+                            f"verified: {error}"
+                        ),
+                    }
+                self.device.close(safe_output_off=False)
+                self.state.output_commanded = False
+                self.state.last_error = None
+            self._stop_event.set()
+            callback = self._shutdown_callback
+            if callback is not None:
+                threading.Thread(target=callback, daemon=True).start()
+            return {
+                "ok": True,
+                "message": "output-off verified; bridge released; shutdown requested",
+            }
+        finally:
+            self._priority_off.clear()
 
     def _ensure_connected(self) -> None:
         if self.device.connected:
             return
         self.device.connect()
+        # Use the full automation edition's connection contract: a newly
+        # opened session is not usable until OFF is sent and 0 V is observed.
+        self.device.force_safe_start()
+        verified, measurement, verification_error = self._verify_output_state(False)
+        if not verified or measurement is None:
+            try:
+                self.device.abandon_connection()
+            except Exception:
+                pass
+            raise DeviceError(
+                f"reconnect output-off verification failed: {verification_error}"
+            )
         self.state.reconnect_count += 1
+        self.state.output_commanded = False
+        self._output_enable_ready_at = time.monotonic() + float(
+            getattr(self.device, "stabilization_delay", 0.0)
+        )
 
     def _refresh_status(self) -> None:
         with self._lock:
@@ -138,12 +188,17 @@ class BridgeController:
                 "consecutive_errors": self.state.consecutive_errors,
                 "reconnect_count": self.state.reconnect_count,
                 "output_commanded": self.state.output_commanded,
+                "telemetry_mode": (
+                    "on_demand" if self.poll_interval == 0.0 else "background"
+                ),
+                "poll_interval_s": self.poll_interval,
                 "last_error": self.state.last_error,
             }
 
     def _status_response(self) -> dict[str, Any]:
         age = self._measurement_age()
-        if age is None or age > max(2.5, self.poll_interval * 2.5):
+        cache_horizon = max(15.0, self.poll_interval * 2.5)
+        if age is None or age > cache_horizon:
             self._refresh_status()
 
         with self._lock:
@@ -165,6 +220,10 @@ class BridgeController:
         with self._lock:
             try:
                 self._ensure_connected()
+                if enabled:
+                    remaining = self._output_enable_ready_at - time.monotonic()
+                    if remaining > 0.0:
+                        time.sleep(remaining)
                 self.device.set_output(enabled)
                 verified, measurement, verification_error = self._verify_output_state(
                     enabled

@@ -1,5 +1,7 @@
 import struct
 
+import ips3608_bridge.protocol as protocol
+
 from ips3608_bridge.protocol import (
     COMMAND_READ,
     REGISTER_LIVE,
@@ -41,3 +43,12 @@ def test_extract_and_decode_live_frame():
 def test_live_request_is_read_only():
     assert live_request() == bytes.fromhex("F1 A1 C3 01 00 C4")
 
+
+def test_setpoint_registers_and_packets_are_not_exposed():
+    for name in (
+        "REGISTER_SET_VOLTAGE",
+        "REGISTER_SET_CURRENT",
+        "set_voltage_packet",
+        "set_current_packet",
+    ):
+        assert not hasattr(protocol, name)

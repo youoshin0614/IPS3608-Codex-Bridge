@@ -54,7 +54,8 @@ class IPS3608Device:
         read_timeout: float = 0.2,
         serial_factory: SerialFactory = serial.Serial,
         min_write_gap: float = 0.25,
-        temperature_interval: float = 30.0,
+        temperature_interval: float | None = None,
+        stabilization_delay: float = 3.0,
     ) -> None:
         self.port = port
         self.baudrate = baudrate
@@ -66,8 +67,13 @@ class IPS3608Device:
         self._last_temperature: float | None = None
         self._min_write_gap = max(0.0, min_write_gap)
         self._last_write_at = 0.0
-        self._temperature_interval = max(1.0, temperature_interval)
+        # Temperature telemetry is optional and requires an additional serial
+        # transaction.  Disable it by default to keep the CDC traffic minimal.
+        self._temperature_interval = (
+            None if temperature_interval is None else max(1.0, temperature_interval)
+        )
         self._last_temperature_at = 0.0
+        self.stabilization_delay = max(0.0, stabilization_delay)
 
     @property
     def connected(self) -> bool:
@@ -99,7 +105,9 @@ class IPS3608Device:
                     last_error = exc
                     self._raw_close()
                     if attempt + 1 < max(1, attempts):
-                        time.sleep(0.15 * (attempt + 1))
+                        # Error 31/995 means the Windows USB stack needs time
+                        # to tear down the failed endpoint before another open.
+                        time.sleep(1.0 * (attempt + 1))
                         self._prime_port()
 
             raise DeviceError(
@@ -115,7 +123,7 @@ class IPS3608Device:
                 )
                 voltage, current, device_power = decode_live(live.payload)
 
-                if (
+                if self._temperature_interval is not None and (
                     self._last_temperature is None
                     or time.monotonic() - self._last_temperature_at
                     >= self._temperature_interval
@@ -149,9 +157,13 @@ class IPS3608Device:
             self._require_connection()
             try:
                 self._write(output_packet(enabled))
-                time.sleep(0.05)
+                time.sleep(0.1)
             except (OSError, serial.SerialException) as exc:
                 raise DeviceError(f"output command failed: {exc}") from exc
+
+    def force_safe_start(self) -> None:
+        """Every new serial session begins by commanding output off."""
+        self.set_output(False)
 
     def close(self, safe_output_off: bool = True) -> None:
         with self._io_lock:
@@ -207,7 +219,7 @@ class IPS3608Device:
         finally:
             if primer is not None and primer.is_open:
                 primer.close()
-        time.sleep(0.1)
+        time.sleep(0.5)
 
     def _query(
         self,
@@ -279,6 +291,7 @@ class SimulatedDevice:
         self.output_enabled = False
         self.connect_count = 0
         self._temperature = 31.0
+        self.stabilization_delay = 0.0
 
     def connect(self, attempts: int = 3) -> None:
         del attempts
@@ -309,6 +322,9 @@ class SimulatedDevice:
         if not self.connected:
             raise DeviceError("simulated device is not connected")
         self.output_enabled = enabled
+
+    def force_safe_start(self) -> None:
+        self.set_output(False)
 
     def close(self, safe_output_off: bool = True) -> None:
         if safe_output_off:
