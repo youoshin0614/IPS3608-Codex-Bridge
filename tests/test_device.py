@@ -1,5 +1,7 @@
 import struct
 
+import pytest
+
 from ips3608_bridge.device import IPS3608Device
 from ips3608_bridge.protocol import (
     COMMAND_READ,
@@ -107,3 +109,21 @@ def test_temperature_polling_is_disabled_by_default():
 
     assert measurement.temperature_c is None
     assert temperature_request() not in created[0].writes
+
+
+def test_windows_error_31_stops_nested_connect_retries():
+    calls = 0
+
+    def failed_serial_factory(**kwargs):
+        nonlocal calls
+        calls += 1
+        error = OSError("simulated Windows device failure")
+        error.winerror = 31
+        raise error
+
+    device = IPS3608Device("COM3", serial_factory=failed_serial_factory)
+
+    with pytest.raises(Exception, match="after 1 attempts"):
+        device.connect(attempts=3)
+
+    assert calls == 1

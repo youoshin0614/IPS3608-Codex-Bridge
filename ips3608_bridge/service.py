@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .device import DeviceError, Measurement
+from .diagnostics import ErrorReporter, classify_error, error_details_dict
 
 
 LOG = logging.getLogger(__name__)
@@ -26,6 +27,9 @@ class BridgeState:
     consecutive_errors: int = 0
     reconnect_count: int = 0
     output_commanded: bool | None = None
+    safety_interlock: bool = False
+    safety_interlock_reason: str | None = None
+    last_error_kind: str | None = None
 
 
 class BridgeController:
@@ -45,6 +49,7 @@ class BridgeController:
         self._monitor: threading.Thread | None = None
         self._shutdown_callback: Callable[[], None] | None = None
         self._output_enable_ready_at = 0.0
+        self._error_reporter = ErrorReporter()
 
     def set_shutdown_callback(self, callback: Callable[[], None]) -> None:
         self._shutdown_callback = callback
@@ -67,7 +72,7 @@ class BridgeController:
             try:
                 self.device.close(safe_output_off=True)
             except Exception as exc:
-                LOG.warning("safe device close failed: %s", exc)
+                self._record_error("safe_device_close_failed", exc)
 
     def handle(self, command: str) -> dict[str, Any]:
         if command not in ALLOWED_COMMANDS:
@@ -80,13 +85,17 @@ class BridgeController:
         if command == "health":
             return self._health_response()
         if command == "status":
+            if self.state.safety_interlock:
+                return self._interlock_response("status")
             return self._status_response()
         if command == "on":
+            if self.state.safety_interlock:
+                return self._interlock_response("on")
             return self._output_response(True)
         if command == "off":
             self._priority_off.set()
             try:
-                return self._output_response(False)
+                return self._off_response()
             finally:
                 self._priority_off.clear()
         if command == "shutdown":
@@ -135,10 +144,14 @@ class BridgeController:
         finally:
             self._priority_off.clear()
 
-    def _ensure_connected(self) -> None:
+    def _ensure_connected(
+        self, *, safety_operation: bool = False
+    ) -> Measurement | None:
         if self.device.connected:
-            return
-        self.device.connect()
+            return None
+        if self.state.safety_interlock and not safety_operation:
+            raise DeviceError("safety interlock blocks automatic device reconnect")
+        self.device.connect(attempts=1 if safety_operation else 3)
         # Use the full automation edition's connection contract: a newly
         # opened session is not usable until OFF is sent and 0 V is observed.
         self.device.force_safe_start()
@@ -156,6 +169,7 @@ class BridgeController:
         self._output_enable_ready_at = time.monotonic() + float(
             getattr(self.device, "stabilization_delay", 0.0)
         )
+        return measurement
 
     def _refresh_status(self) -> None:
         with self._lock:
@@ -165,11 +179,14 @@ class BridgeController:
                 self.state.last_measurement = measurement
                 self.state.last_measurement_at = time.monotonic()
                 self.state.last_error = None
+                self.state.last_error_kind = None
                 self.state.consecutive_errors = 0
             except Exception as exc:
-                self.state.last_error = str(exc)
-                self.state.consecutive_errors += 1
-                LOG.warning("status refresh failed: %s", exc)
+                self._record_error(
+                    "status_refresh_failed",
+                    exc,
+                    force_unknown=True,
+                )
                 try:
                     self.device.abandon_connection()
                 except Exception:
@@ -188,6 +205,10 @@ class BridgeController:
                 "consecutive_errors": self.state.consecutive_errors,
                 "reconnect_count": self.state.reconnect_count,
                 "output_commanded": self.state.output_commanded,
+                "output_state": self._output_state(),
+                "safety_interlock": self.state.safety_interlock,
+                "safety_interlock_reason": self.state.safety_interlock_reason,
+                "last_error_kind": self.state.last_error_kind,
                 "telemetry_mode": (
                     "on_demand" if self.poll_interval == 0.0 else "background"
                 ),
@@ -202,11 +223,12 @@ class BridgeController:
             self._refresh_status()
 
         with self._lock:
-            if self.state.last_measurement is None:
+            if self.state.last_measurement is None or not self.device.connected:
                 return {
                     "ok": False,
                     "error": "device_unavailable",
                     "message": self.state.last_error or "no measurement available",
+                    "output_state": self._output_state(),
                 }
             return {
                 "ok": True,
@@ -251,7 +273,10 @@ class BridgeController:
                         if safe_off_error:
                             verification_error = safe_off_error
                     if not verified:
-                        self.state.last_error = verification_error
+                        self._record_error(
+                            "output_verification_failed",
+                            verification_error,
+                        )
                         return {
                             "ok": False,
                             "error": "output_verification_failed",
@@ -259,6 +284,7 @@ class BridgeController:
                         }
                 self.state.output_commanded = enabled
                 self.state.last_error = None
+                self.state.last_error_kind = None
                 return {
                     "ok": True,
                     "output": "on" if enabled else "off",
@@ -268,8 +294,11 @@ class BridgeController:
                     ),
                 }
             except Exception as exc:
-                self.state.last_error = str(exc)
-                self.state.consecutive_errors += 1
+                self._record_error(
+                    "output_command_failed",
+                    exc,
+                    force_unknown=True,
+                )
                 try:
                     self.device.abandon_connection()
                 except Exception:
@@ -302,19 +331,45 @@ class BridgeController:
                     "message": self.state.last_error,
                 }
 
+    def _off_response(self) -> dict[str, Any]:
+        """Use one bounded safety path for OFF, including while interlocked."""
+        with self._lock:
+            measurement, error = self._recover_and_verify_output_off()
+            if error is not None or measurement is None:
+                return {
+                    "ok": False,
+                    "error": "output_off_unverified",
+                    "message": error,
+                    "output_state": "unknown",
+                    "safety_interlock": self.state.safety_interlock,
+                }
+            return {
+                "ok": True,
+                "output": "off",
+                "message": "output-off verified by voltage telemetry",
+                "verified_voltage_v": measurement.voltage_v,
+            }
+
     def _recover_and_verify_output_off(
         self,
     ) -> tuple[Measurement | None, str | None]:
         last_error = "output-off was not attempted"
         for attempt in range(2):
             try:
-                self._ensure_connected()
+                safe_start_measurement = self._ensure_connected(
+                    safety_operation=True
+                )
+                if safe_start_measurement is not None:
+                    self.state.output_commanded = False
+                    self._clear_safety_interlock()
+                    return safe_start_measurement, None
                 self.device.set_output(False)
                 verified, measurement, verification_error = (
                     self._verify_output_state(False)
                 )
                 if verified and measurement is not None:
                     self.state.output_commanded = False
+                    self._clear_safety_interlock()
                     return measurement, None
                 last_error = verification_error
             except Exception as exc:
@@ -325,6 +380,12 @@ class BridgeController:
                 pass
             if attempt == 0:
                 time.sleep(0.75)
+        self._record_error(
+            "output_off_unverified",
+            last_error,
+            force_unknown=True,
+            latch_interlock=True,
+        )
         return None, last_error
 
     def _verify_output_state(
@@ -354,6 +415,70 @@ class BridgeController:
             if remaining > 0:
                 time.sleep(min(0.2, remaining))
         return False, last_measurement, last_error
+
+    def _record_error(
+        self,
+        event: str,
+        exc: BaseException | str,
+        *,
+        force_unknown: bool = False,
+        latch_interlock: bool = False,
+    ) -> None:
+        details = classify_error(exc)
+        self.state.last_error = str(exc)
+        self.state.last_error_kind = details.kind
+        self.state.consecutive_errors += 1
+        if force_unknown or details.requires_manual_recovery:
+            self.state.output_commanded = None
+        if details.requires_manual_recovery or latch_interlock:
+            self.state.safety_interlock = True
+            self.state.safety_interlock_reason = (
+                details.action
+                if details.requires_manual_recovery
+                else "Output-off was not verified. Reset the USB path and run OFF."
+            )
+        self._error_reporter.report(
+            LOG,
+            event,
+            exc,
+            output_state=self._output_state(),
+            safety_interlock=self.state.safety_interlock,
+            device_port=str(self.device.port),
+        )
+
+    def _clear_safety_interlock(self) -> None:
+        if self.state.safety_interlock:
+            LOG.info(
+                "safety interlock cleared after output-off verification",
+                extra={"event": "safety_interlock_cleared"},
+            )
+        self.state.safety_interlock = False
+        self.state.safety_interlock_reason = None
+        self.state.last_error = None
+        self.state.last_error_kind = None
+        self.state.consecutive_errors = 0
+
+    def _output_state(self) -> str:
+        if self.state.output_commanded is True:
+            return "on"
+        if self.state.output_commanded is False:
+            return "off"
+        return "unknown"
+
+    def _interlock_response(self, command: str) -> dict[str, Any]:
+        details = classify_error(self.state.last_error or "device error")
+        return {
+            "ok": False,
+            "error": "safety_interlock_active",
+            "message": (
+                f"{command} blocked because output state is unknown after "
+                f"{self.state.last_error_kind or 'a transport fault'}; "
+                "change the physical USB path and run OFF"
+            ),
+            "output_state": "unknown",
+            "safety_interlock": True,
+            "recovery": error_details_dict(details),
+        }
 
     def _measurement_age(self) -> float | None:
         if not self.state.last_measurement_at:

@@ -17,6 +17,7 @@ from serial.tools import list_ports
 
 from .client import BridgeUnavailable, request
 from .device import IPS3608Device, SimulatedDevice
+from .diagnostics import configure_logging, diagnostics_snapshot
 from .service import run_service
 
 
@@ -88,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("off", "disable power output"),
         ("stop", "safely stop the bridge and release the device"),
         ("ports", "list available serial ports"),
+        ("diagnostics", "show local logs without contacting the device"),
     ):
         commands.add_parser(name, help=help_text)
 
@@ -101,6 +103,8 @@ def main(argv: Iterable[str] | None = None) -> int:
         return _serve(args)
     if args.command == "ports":
         return _ports(args.json)
+    if args.command == "diagnostics":
+        return _diagnostics(args.json)
     if args.command == "start":
         try:
             response = _ensure_started(
@@ -130,11 +134,10 @@ def main(argv: Iterable[str] | None = None) -> int:
 
 
 def _serve(args: argparse.Namespace) -> int:
-    log_path = state_directory() / "bridge.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.FileHandler(log_path, encoding="utf-8")],
+    configure_logging(state_directory())
+    logging.getLogger(__name__).info(
+        "bridge process starting",
+        extra={"event": "service_start", "device_port": args.device_port},
     )
     device: Any
     if args.simulate:
@@ -268,6 +271,25 @@ def _ports(as_json: bool) -> int:
     return 0
 
 
+def _diagnostics(as_json: bool) -> int:
+    snapshot = diagnostics_snapshot(state_directory())
+    if as_json:
+        print(json.dumps(snapshot, ensure_ascii=False, sort_keys=True))
+        return 0
+    print(f"State directory: {snapshot['state_directory']}")
+    for item in snapshot["files"]:
+        print(f"{item['name']}: {item['size_bytes']} bytes")
+    kinds = ", ".join(snapshot["error_kinds"]) or "none"
+    print(f"Recent error kinds: {kinds}")
+    for item in snapshot["recent_errors"][-5:]:
+        print(
+            f"{item.get('timestamp', 'unknown time')} "
+            f"{item.get('error_kind', item.get('event', 'error'))}: "
+            f"{item.get('message', '')}"
+        )
+    return 0
+
+
 def _print_response(command: str, response: dict[str, Any], as_json: bool) -> int:
     if as_json:
         print(json.dumps(response, ensure_ascii=False, sort_keys=True))
@@ -297,6 +319,11 @@ def _print_response(command: str, response: dict[str, Any], as_json: bool) -> in
         )
         if response.get("last_error"):
             print(f"last_error={response['last_error']}")
+        if response.get("safety_interlock"):
+            print(
+                "SAFETY INTERLOCK: output state unknown; change the USB path "
+                "and run OFF"
+            )
     elif command in {"on", "off"}:
         print(f"Output {response['output']}")
     else:

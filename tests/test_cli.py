@@ -12,6 +12,11 @@ def test_cli_has_no_voltage_current_set_or_raw_command():
             parser.parse_args([command])
 
 
+def test_diagnostics_is_local_command():
+    args = build_parser().parse_args(["diagnostics"])
+    assert args.command == "diagnostics"
+
+
 def test_default_poll_interval_is_conservative():
     args = build_parser().parse_args(["start"])
     assert args.poll_interval == 0.0

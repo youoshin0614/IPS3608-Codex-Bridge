@@ -23,6 +23,7 @@ from .protocol import (
     session_packet,
     temperature_request,
 )
+from .diagnostics import classify_error
 
 
 class DeviceError(RuntimeError):
@@ -85,7 +86,9 @@ class IPS3608Device:
                 return
 
             last_error: BaseException | None = None
+            attempts_made = 0
             for attempt in range(max(1, attempts)):
+                attempts_made += 1
                 try:
                     self._raw_close()
                     self._serial = self._new_serial(dtr=True, rts=True)
@@ -104,6 +107,8 @@ class IPS3608Device:
                 except Exception as exc:
                     last_error = exc
                     self._raw_close()
+                    if classify_error(exc).requires_manual_recovery:
+                        break
                     if attempt + 1 < max(1, attempts):
                         # Error 31/995 means the Windows USB stack needs time
                         # to tear down the failed endpoint before another open.
@@ -111,7 +116,8 @@ class IPS3608Device:
                         self._prime_port()
 
             raise DeviceError(
-                f"unable to connect to {self.port} after {max(1, attempts)} attempts: {last_error}"
+                f"unable to connect to {self.port} after {attempts_made} "
+                f"attempts: {last_error}"
             ) from last_error
 
     def read_status(self) -> Measurement:

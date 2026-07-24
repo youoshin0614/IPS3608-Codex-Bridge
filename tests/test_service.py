@@ -66,6 +66,21 @@ class CountingStatusDevice(SimulatedDevice):
         return super().read_status()
 
 
+class Windows31ThenRecoverDevice(SimulatedDevice):
+    def __init__(self):
+        super().__init__()
+        self.fail_connect = True
+        self.connect_attempts = 0
+
+    def connect(self, attempts: int = 3) -> None:
+        self.connect_attempts += 1
+        if self.fail_connect:
+            error = OSError("simulated Windows device failure")
+            error.winerror = 31
+            raise error
+        super().connect(attempts=attempts)
+
+
 def test_controller_keeps_one_device_connection_and_blocks_unsafe_commands():
     device = SimulatedDevice()
     controller = BridgeController(device, poll_interval=60.0)
@@ -125,6 +140,10 @@ def test_on_requires_nonzero_voltage_and_is_never_retried():
         assert response["error"] == "output_verification_failed"
         assert device.on_write_count == 1
         assert device.output_enabled is False
+        health = controller.handle("health")
+        assert health["last_error_kind"] == "device_error"
+        assert health["consecutive_errors"] == 1
+        assert health["output_state"] == "off"
     finally:
         controller.close()
 
@@ -181,6 +200,32 @@ def test_shutdown_is_refused_until_output_off_is_verified():
         controller.close()
 
 
+def test_failed_explicit_off_marks_output_unknown():
+    device = PersistentOffFailureDevice()
+    controller = BridgeController(
+        device,
+        poll_interval=60.0,
+        output_verify_timeout=0.05,
+    )
+    controller.start()
+    try:
+        assert controller.handle("on")["ok"]
+        device.fail_off = True
+
+        response = controller.handle("off")
+
+        assert response["ok"] is False
+        assert response["error"] == "output_off_unverified"
+        health = controller.handle("health")
+        assert health["output_state"] == "unknown"
+        assert health["last_error_kind"] == "device_error"
+        assert health["safety_interlock"] is True
+    finally:
+        device.fail_off = False
+        controller.handle("off")
+        controller.close()
+
+
 def test_off_reconnect_uses_automation_safe_start_contract():
     device = OneShotOffFailureDevice()
     controller = BridgeController(device, poll_interval=60.0)
@@ -215,5 +260,34 @@ def test_default_on_demand_mode_does_not_poll_serial_in_background():
             assert controller.handle("status")["ok"]
 
         assert device.read_count == reads_after_start
+    finally:
+        controller.close()
+
+
+def test_windows_error_31_latches_interlock_until_verified_off():
+    device = Windows31ThenRecoverDevice()
+    controller = BridgeController(
+        device,
+        poll_interval=0.0,
+        output_verify_timeout=0.05,
+    )
+    controller.start()
+    try:
+        attempts_after_fault = device.connect_attempts
+        health = controller.handle("health")
+        assert health["safety_interlock"] is True
+        assert health["last_error_kind"] == "windows_error_31"
+        assert health["output_state"] == "unknown"
+
+        assert controller.handle("status")["error"] == "safety_interlock_active"
+        assert controller.handle("on")["error"] == "safety_interlock_active"
+        assert device.connect_attempts == attempts_after_fault
+
+        device.fail_connect = False
+        response = controller.handle("off")
+        assert response["ok"] is True
+        assert response["verified_voltage_v"] <= 0.1
+        assert controller.handle("health")["safety_interlock"] is False
+        assert controller.handle("health")["output_state"] == "off"
     finally:
         controller.close()

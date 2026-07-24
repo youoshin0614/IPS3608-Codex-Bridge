@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Latch a safety interlock after Windows error 31/995, short serial writes, or
+  write timeouts. Block automatic status reconnects and output-on until a
+  bounded output-off recovery verifies at most 0.1 V.
+- Report disconnected stale telemetry as unavailable instead of successful.
+- Add rotating human logs, structured JSONL error records, duplicate
+  suppression, error classification, and a hardware-free `diagnostics` command.
+
 ## 0.3.0 - 2026-07-22
 
 - Switch to on-demand telemetry with a 15-second cache and disable optional temperature polling by default.
